@@ -21,9 +21,19 @@ It runs each CLI in headless mode, so **no API keys are needed: each agent uses 
 
 ## Install
 
+Requires Node.js 20 or later. Install straight from GitHub, no clone needed:
+
 ```bash
-npm link            # once, in this folder → `aichat` works anywhere
-# If you don't have Gemini CLI
+npm i -g --allow-git=root github:leemyeongje/aichat
+```
+
+npm 12 and later refuse git installs unless `--allow-git` is set; older npm versions don't need the flag. Run the same command again to update.
+
+To work on aichat itself, clone the repo and run `npm link` in it instead.
+
+If you don't have Gemini CLI:
+
+```bash
 npm i -g @google/gemini-cli && gemini   # log in once
 ```
 
