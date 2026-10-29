@@ -1,0 +1,13 @@
+{
+  "name": "aichat",
+  "version": "0.1.0",
+  "description": "Claude Code · Codex · Gemini CLI를 하나의 단체 대화방으로 묶는 터미널 오케스트레이터",
+  "type": "module",
+  "bin": {
+    "aichat": "./bin/aichat.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
