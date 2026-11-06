@@ -10,6 +10,11 @@ export const DEFAULT_CONFIG = {
   maxAutoTurns: 8,
   // Roles used by /task: the developer builds, the reviewer verifies/debugs.
   workflow: { developer: 'claude', reviewer: 'codex' },
+  // Outside /task, a turn that edits files and hands off to no one goes to
+  // the workflow reviewer.
+  autoReview: true,
+  // An agent that hits its usage limit sits out this long; others take over.
+  limitCooldownMinutes: 15,
   agents: {
     claude: {
       bin: 'claude',

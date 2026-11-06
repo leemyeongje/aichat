@@ -45,6 +45,8 @@ export class Room extends EventEmitter {
     this.autoTurns = 0;
     // Active /task: { pair: [developer, reviewer], agreed: { name: bool } }.
     this.workflow = null;
+    this.stops = 0;
+    this.limitedUntil = {}; // agent name → ms timestamp its usage limit ends
     this.stateDir = path.join(cwd, '.aichat');
     this.load();
   }
@@ -92,6 +94,39 @@ export class Room extends EventEmitter {
     return Object.keys(this.agents);
   }
 
+  isLimited(name) {
+    return (this.limitedUntil[name] ?? 0) > Date.now();
+  }
+
+  clearLimit(name) {
+    delete this.limitedUntil[name];
+  }
+
+  // Who takes over for an agent that hit its usage limit: the default agent
+  // if it can, otherwise the first other agent that is installed and free.
+  fallbackFor(name) {
+    const ok = (n) => n !== name && this.agents[n]?.available && !this.isLimited(n);
+    const def = this.config.defaultAgent;
+    return ok(def) ? def : this.names.find(ok) ?? null;
+  }
+
+  get activeDefault() {
+    const preferred = this.config.defaultAgent;
+    return this.isLimited(preferred) ? this.fallbackFor(preferred) ?? preferred : preferred;
+  }
+
+  // A redirected job may return to the agent that wrote the handoff. Its own
+  // message is excluded from buildPrompt(), so repeat the pending request.
+  redirectNote(job, sub) {
+    const request = job.request?.slice(0, MAX_MSG_CHARS) ?? '';
+    this.append({
+      from: 'aichat',
+      to: [sub],
+      text: `[aichat] @${job.agent} 는 사용량 한도로 일시 중단됐습니다. @${sub} 가 아래 요청을 이어서 처리하라. ` +
+        `@${job.agent} 에게 다시 넘기지 말고 현재 파일 상태를 먼저 확인하라.\n\n${request}`,
+    });
+  }
+
   // Splits a leading "@a @b text" into targets and body.
   parseTargets(text) {
     const targets = [];
@@ -127,14 +162,14 @@ export class Room extends EventEmitter {
   // User input from the terminal.
   say(text, { prefix = '' } = {}) {
     let { targets, body } = this.parseTargets(text);
-    if (!targets.length) targets = [this.config.defaultAgent];
+    if (!targets.length) targets = [this.activeDefault];
     if (!body) return;
     this.autoTurns = 0;
     // A new user request makes earlier agreements stale.
     if (this.workflow) this.workflow.agreed = {};
     this.append({ from: 'user', to: targets, text: prefix + body });
     // User requests jump ahead of queued agent handoffs.
-    const jobs = targets.map((agent) => ({ agent, from: 'user' }));
+    const jobs = targets.map((agent) => ({ agent, from: 'user', request: prefix + body }));
     const firstAgentJob = this.queue.findIndex((j) => j.from !== 'user');
     this.queue.splice(firstAgentJob === -1 ? this.queue.length : firstAgentJob, 0, ...jobs);
     this.pump();
@@ -152,7 +187,7 @@ export class Room extends EventEmitter {
 
   // /init: one agent surveys the project and writes the shared instructions
   // file that every vendor CLI reads (CLAUDE.md just imports it).
-  init(agent = this.config.defaultAgent) {
+  init(agent = this.activeDefault) {
     const prefix =
       `[작업 지시 — 프로젝트 지침 파일 생성] 이 저장소를 분석해서 루트에 AGENTS.md 를 작성하라. ` +
       `AGENTS.md 는 Claude Code, Codex, Gemini CLI 가 이 저장소에서 일할 때 읽는 공용 지침 파일이다.\n` +
@@ -192,6 +227,56 @@ export class Room extends EventEmitter {
     };
   }
 
+  // Outside /task, file edits by anyone but the reviewer are sent to the
+  // reviewer instead of straight back to the user, unless the agent already
+  // handed off to another agent or is asking the user a [질문].
+  applyAutoReview(name, text, edited, handoffs) {
+    const { reviewer } = this.config.workflow;
+    const skip =
+      !this.config.autoReview ||
+      !edited ||
+      this.workflow ||
+      name === reviewer ||
+      !this.agents[reviewer]?.available ||
+      this.isLimited(reviewer) ||
+      ASK_USER.test(text) ||
+      handoffs.some((h) => h.to !== 'user');
+    if (skip) return { handoffs };
+    return {
+      handoffs: [{ to: reviewer }],
+      note:
+        `[aichat] @${name} 가 파일을 수정했습니다. @${reviewer} 는 이 변경을 검토하라. ` +
+        `문제가 없으면 @user 에게 결과를 짧게 보고하고, 문제가 있으면 직접 고치거나 @${name} 에게 수정을 요청하라.`,
+    };
+  }
+
+  // The agent hit its usage limit: bench it for a while and give the same job
+  // to another agent. A /task can't reach consensus with one side missing, so
+  // it ends here instead of letting the substitute agree with itself.
+  handleLimit(job, text) {
+    const name = job.agent;
+    const minutes = this.config.limitCooldownMinutes;
+    this.limitedUntil[name] = Date.now() + minutes * 60_000;
+    if (text) this.append({ from: name, to: [], text });
+    if (this.workflow?.pair.includes(name)) {
+      this.workflow = null;
+      this.emit('notice', `/task ended: @${name} hit its usage limit, so the two agents can't reach consensus.`);
+    }
+    const sub = this.fallbackFor(name);
+    if (!sub) {
+      this.emit('notice', `@${name} hit its usage limit and no other agent is free. Retry later with /default ${name}.`);
+      this.save();
+      return;
+    }
+    this.emit('notice', `@${name} hit its usage limit; @${sub} takes over for ${minutes} min (/default ${name} retries it now).`);
+    this.redirectNote(job, sub);
+    this.save();
+    // Preserve the priority of user messages typed while the agent worked.
+    const firstAgentJob = this.queue.findIndex((queued) => queued.from !== 'user');
+    const at = job.from === 'user' ? 0 : firstAgentJob === -1 ? this.queue.length : firstAgentJob;
+    this.queue.splice(at, 0, { ...job, agent: sub });
+  }
+
   // An agent reports to the user only once the agents are done with each
   // other: a reply that hands work to another agent drops its @user line, and
   // a [질문] to the user holds the agent handoffs until the user answers.
@@ -203,6 +288,8 @@ export class Room extends EventEmitter {
   }
 
   stop() {
+    // Lets pump() tell that the turn in flight was stopped on purpose.
+    this.stops++;
     this.workflow = null;
     this.queue = [];
     this.current?.stop();
@@ -246,6 +333,18 @@ export class Room extends EventEmitter {
     if (this.current) return;
     while (this.queue.length) {
       const job = this.queue.shift();
+      if (this.isLimited(job.agent)) {
+        const sub = this.fallbackFor(job.agent);
+        const until = new Date(this.limitedUntil[job.agent]).toLocaleTimeString();
+        if (!sub) {
+          this.emit('notice', `@${job.agent} is over its usage limit until ${until} and no other agent is free. Retry with /default ${job.agent}.`);
+          continue;
+        }
+        this.emit('notice', `@${job.agent} is over its usage limit until ${until}; @${sub} takes this turn.`);
+        this.redirectNote(job, sub);
+        this.save();
+        job.agent = sub;
+      }
       const agent = this.agents[job.agent];
       if (!agent.available) {
         this.emit('notice', `@${job.agent} is not installed (${agent.cfg.bin} not found on PATH).`);
@@ -258,8 +357,10 @@ export class Room extends EventEmitter {
       this.lastSeen[job.agent] = this.transcript.length;
       this.current = agent;
       this.emit('start', job.agent, job.from);
+      const stops = this.stops;
+      const transcript = this.transcript;
 
-      const { text, error, edited } = await agent.run(prompt, {
+      let { text, error, edited, limited } = await agent.run(prompt, {
         cwd: this.cwd,
         systemPrompt: this.systemPrompt(job.agent),
         onEvent: (ev) => this.emit('event', job.agent, ev),
@@ -267,6 +368,24 @@ export class Room extends EventEmitter {
       this.current = null;
 
       if (error) this.emit('notice', `@${job.agent} error: ${error}`);
+      // /new during the turn: drop its result, including a session id the
+      // dying process may still have reported.
+      if (this.transcript !== transcript) {
+        agent.sessionId = null;
+        continue;
+      }
+      // /stop during the turn: keep what it said, but follow no handoffs.
+      if (this.stops !== stops) {
+        if (text) this.append({ from: job.agent, to: [], text });
+        this.save();
+        continue;
+      }
+      if (limited) {
+        this.handleLimit(job, text);
+        continue;
+      }
+      // A turn that failed after editing files still needs review.
+      if (!text && edited) text = `[aichat] @${job.agent} 가 파일을 수정한 뒤 답변 없이 종료됐습니다 (${error ?? 'no reply'}).`;
       if (!text) {
         this.save();
         continue;
@@ -274,6 +393,7 @@ export class Room extends EventEmitter {
 
       let { handoffs, note } = this.applyWorkflow(job.agent, text, edited, this.parseHandoffs(job.agent, text));
       handoffs = this.deferUserReport(text, handoffs);
+      if (!note) ({ handoffs, note } = this.applyAutoReview(job.agent, text, edited, handoffs));
       const targets = handoffs.map((h) => h.to);
       // lastSeen stays at the turn's start so messages the user typed while
       // this agent was working are still delivered on its next turn.
@@ -288,7 +408,7 @@ export class Room extends EventEmitter {
           break;
         }
         this.autoTurns++;
-        this.queue.push({ agent: h.to, from: job.agent });
+        this.queue.push({ agent: h.to, from: job.agent, request: h.text || text });
       }
     }
     this.emit('idle');

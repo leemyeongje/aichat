@@ -54,7 +54,7 @@ aichat              # or: aichat /path/to/project
 | `/init [name]` | Analyzes the project and writes `AGENTS.md` (by the default agent, or a named one like `/init codex`). Creates a one-line `CLAUDE.md` with `@AGENTS.md` if there is none |
 | `/stop`, `Ctrl+C` | Stops the running agent and clears the queue |
 | `/agents` | Status, role, and session ID of each agent |
-| `/default name` | Changes the default agent |
+| `/default name` | Changes the default agent (also retries an agent benched by a usage limit) |
 | `/auto N` | Max automatic agent-to-agent handoffs (default 8, 0 turns it off) |
 | `/verbose` | Shows reasoning and detailed logs |
 | `/history N` | Replays recent messages |
@@ -68,6 +68,8 @@ You can type while an agent is working. Your message is added to the transcript 
 - **Per-agent memory**: each agent resumes its own session (`claude --resume`, `codex exec resume`, `gemini --resume`). Session IDs are saved in `.aichat/sessions.json`, so conversations continue after restarting aichat.
 - **Handoffs**: a line in an agent's reply that starts with `@name ...` passes the next turn to that agent. Replies that end with `@user` or no mention return to you. If one reply mentions both `@user` and another agent, only the agent handoff is followed and the report to you waits until the agents are done (with `[질문]`, it's the other way around: the agents wait for your answer).
 - **Consensus workflow (`/task`)**: whenever one agent changes code, the other reviews the change. The task ends and is reported to you only when both agents' latest replies contain `[동의]` and the last one didn't change code. Earlier attempts to hand off to `@user` are sent back to the other agent (unless they contain `[질문]`). Round trips count against the `/auto` limit. The reviewer (codex) is told on every review turn to critically review the whole change against the original request, not just the part it was asked to check.
+- **Automatic review**: outside `/task`, when an agent edits files and doesn't hand off to another agent, aichat sends the turn to the reviewer (codex), who reports to you or asks for fixes. It also applies when the agent edited files and then exited without a reply. It's skipped when the reply asks you a `[질문]`, when you `/stop` the turn, and for the reviewer's own edits. Only edits made through the agents' file-editing tools are detected; files changed by shell commands (`sed`, `git checkout`, scripts) don't trigger a review. Turn it off with `"autoReview": false`.
+- **Usage limits**: when an agent hits its subscription's usage limit, it sits out for 15 minutes (`limitCooldownMinutes`). The next available agent temporarily becomes the default, picks up the interrupted request, and handles work addressed to the limited agent. The original default returns after the cooldown. A `/task` involving the limited agent ends, since consensus needs both. `/default name` retries an agent right away, and `/agents` shows the active default and when the limit ends. The cooldown is a retry interval, not a prediction of when a provider will reset its quota.
 - **One at a time**: all agents edit the same directory, so they never run concurrently; they take turns.
 
 `[동의]` ("agree") and `[질문]` ("question") are the literal markers agents write; the agent prompts are in Korean.
@@ -87,6 +89,8 @@ Override the defaults (`src/config.js`) with `./aichat.config.json` or `~/.aicha
   "defaultAgent": "claude",
   "maxAutoTurns": 8,
   "workflow": { "developer": "claude", "reviewer": "codex" },
+  "autoReview": true,
+  "limitCooldownMinutes": 15,
   "agents": {
     "claude": { "model": "opus" },
     "gemini": { "enabled": false }

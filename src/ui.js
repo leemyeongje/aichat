@@ -20,7 +20,7 @@ ${bold('Usage')}
   /init [name]        Analyze the project and write AGENTS.md (CLAUDE.md imports it)
   /stop  (or Ctrl+C)  Stop the running agent and clear the queue
   /agents             Participants, status, roles, session ids
-  /default name       Change the default agent
+  /default name       Change the default agent (also retries one benched by a usage limit)
   /auto N             Max agent-to-agent handoffs per message (0 = off)
   /verbose            Toggle agents' thinking and detail logs
   /history [N]        Replay the last N messages
@@ -232,7 +232,7 @@ export function startUI(room) {
     },
     task: (arg) => (arg ? room.task(arg) : print('Usage: /task <what to build>')),
     init: (arg) => {
-      const name = arg.replace(/^@/, '').toLowerCase() || room.config.defaultAgent;
+      const name = arg.replace(/^@/, '').toLowerCase() || room.activeDefault;
       if (!room.agents[name]) return print(`Agents: ${room.names.join(', ')}`);
       print('');
       print(`${tag('user')} /init → ${tag(name)}`);
@@ -240,8 +240,16 @@ export function startUI(room) {
     },
     agents: () => {
       for (const [n, a] of Object.entries(room.agents)) {
-        const status = !a.available ? c('31', 'not installed') : room.current === a ? c('33', 'working') : c('32', 'idle');
-        const def = n === room.config.defaultAgent ? dim(' (default)') : '';
+        const status = !a.available
+          ? c('31', 'not installed')
+          : room.current === a
+            ? c('33', 'working')
+            : room.isLimited(n)
+              ? c('31', `usage limit until ${new Date(room.limitedUntil[n]).toLocaleTimeString()}`)
+              : c('32', 'idle');
+        const def = n === room.activeDefault
+          ? dim(n === room.config.defaultAgent ? ' (default)' : ' (temporary default)')
+          : '';
         print(`${tag(n)}${def} ${status}  ${a.cfg.role}`);
         print(dim(`    session: ${a.sessionId ?? '(new)'}`));
       }
@@ -249,7 +257,10 @@ export function startUI(room) {
     default: (arg) => {
       if (!room.agents[arg]) return print(`Agents: ${room.names.join(', ')}`);
       room.config.defaultAgent = arg;
-      print(`Default agent → ${tag(arg)}`);
+      // Also the way to retry an agent before its usage-limit cooldown ends.
+      const wasLimited = room.isLimited(arg);
+      room.clearLimit(arg);
+      print(`Default agent → ${tag(arg)}${wasLimited ? dim(' (usage limit cleared)') : ''}`);
     },
     auto: (arg) => {
       const n = Number.parseInt(arg, 10);

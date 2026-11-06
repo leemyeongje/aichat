@@ -12,6 +12,20 @@ const clip = (s, n = 160) => {
   return s.length > n ? s.slice(0, n - 1) + '…' : s;
 };
 
+// Only recognize a standalone limit notice in normal assistant output. Error
+// channels can also contain provider error codes; never inspect tool output.
+export function isUsageLimit(text, error = false) {
+  const s = String(text ?? '').trim();
+  if (/^(?:you['’]ve|you have) (?:hit|reached|exceeded) your [^\n.]*limit(?:[.\s·—–-].*)?$/i.test(s) && !s.includes('\n')) return true;
+  return error && /(?:\b(?:rate_limit_exceeded|usage_limit_reached|insufficient_quota|RESOURCE_EXHAUSTED)\b|\b429\b|\b(?:usage|rate) limit (?:reached|exceeded)|\b(?:exceeded|exhausted) (?:your |the )?(?:usage |current )?quota|\bquota (?:has been )?(?:exceeded|exhausted))/i.test(s);
+}
+
+const errorText = (value) => {
+  if (typeof value === 'string') return value;
+  if (!value) return 'unknown error';
+  return [value.message, value.code ?? value.status].filter(Boolean).join(' ') || JSON.stringify(value);
+};
+
 export function isInstalled(bin) {
   try {
     execFileSync('which', [bin], { stdio: 'ignore' });
@@ -42,7 +56,7 @@ class Agent {
   }
 
   // Runs one turn. onEvent receives normalized events while streaming.
-  // Resolves with { text, error } where text is the agent's final reply.
+  // Resolves with { text, error, edited, limited }.
   run(prompt, { cwd, systemPrompt, onEvent }) {
     const args = this.buildArgs(prompt, systemPrompt);
     return new Promise((resolve) => {
@@ -56,6 +70,8 @@ class Agent {
       this.textParts = [];
       this.edited = false; // set by parse() when the agent changes files
       let stderr = '';
+      let limited = false;
+      let streamError = null;
 
       readline.createInterface({ input: proc.stdout }).on('line', (line) => {
         line = line.trim();
@@ -65,10 +81,17 @@ class Agent {
           ev = JSON.parse(line);
         } catch {
           // Non-JSON output (warnings, plain text fallback).
+          if (isUsageLimit(line)) limited = true;
           onEvent({ kind: 'info', text: clip(line) });
           return;
         }
-        for (const out of this.parse(ev)) onEvent(out);
+        for (const out of this.parse(ev)) {
+          if (out.kind === 'error') {
+            streamError = out.text;
+            limited ||= isUsageLimit(out.text, true);
+          }
+          onEvent(out);
+        }
       });
       proc.stderr.on('data', (d) => (stderr += d));
 
@@ -79,10 +102,11 @@ class Agent {
       proc.on('close', (code, signal) => {
         this.proc = null;
         const text = (this.finalText || this.textParts.join('\n\n')).trim();
-        let error = null;
+        let error = streamError;
         if (signal) error = `stopped (${signal})`;
         else if (code !== 0 && !text) error = clip(stderr.trim().split('\n').slice(-3).join(' '), 400) || `exit ${code}`;
-        resolve({ text, error, edited: this.edited });
+        limited ||= isUsageLimit(text) || (code !== 0 && isUsageLimit(stderr, true));
+        resolve({ text, error, edited: this.edited, limited });
       });
     });
   }
@@ -113,7 +137,7 @@ class ClaudeAgent extends Agent {
         }
       }
     } else if (ev.type === 'result') {
-      if (ev.is_error) yield { kind: 'error', text: clip(ev.result || ev.subtype, 400) };
+      if (ev.is_error) yield { kind: 'error', text: clip(ev.result || errorText(ev.error) || ev.subtype, 400) };
       else if (typeof ev.result === 'string') this.finalText = ev.result;
     }
   }
@@ -141,8 +165,8 @@ class CodexAgent extends Agent {
 
   *parse(ev) {
     if (ev.type === 'thread.started') this.sessionId = ev.thread_id;
-    else if (ev.type === 'turn.failed') yield { kind: 'error', text: clip(ev.error?.message ?? 'turn failed', 400) };
-    else if (ev.type === 'error') yield { kind: 'error', text: clip(ev.message, 400) };
+    else if (ev.type === 'turn.failed') yield { kind: 'error', text: clip(errorText(ev.error), 400) };
+    else if (ev.type === 'error') yield { kind: 'error', text: clip(errorText(ev.error ?? ev.message), 400) };
     else if (ev.type === 'item.started' && ev.item?.type === 'command_execution') {
       yield { kind: 'tool', text: `$ ${clip(ev.item.command, 140)}` };
     } else if (ev.type === 'item.completed') {
@@ -208,10 +232,10 @@ class GeminiAgent extends Agent {
         if (ev.status === 'error') yield { kind: 'info', text: `  ↳ ${clip(ev.error?.message ?? 'error', 140)}` };
         break;
       case 'error':
-        yield { kind: 'error', text: clip(ev.message, 400) };
+        yield { kind: 'error', text: clip(errorText(ev.error ?? ev.message), 400) };
         break;
       case 'result':
-        if (ev.status === 'error') yield { kind: 'error', text: clip(ev.error?.message ?? 'error', 400) };
+        if (ev.status === 'error') yield { kind: 'error', text: clip(errorText(ev.error), 400) };
         break;
     }
   }
